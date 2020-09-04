@@ -1,0 +1,670 @@
+---
+title: "Survivor Analysis"
+author: "Group 1"
+date: "6/08/2020"
+output:
+  html_document:
+    theme: cerulean
+    highlight: tango
+    code_folding: none
+    toc: yes
+    toc_depth: 3
+    toc_float: true
+
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+#remove all objects from workspace
+rm(list = ls())
+
+# Load necessary packages
+# general
+library(tidyverse)
+library(kableExtra)
+
+# for cleaning and describing the data:
+#install.packages('summarytools')
+library(summarytools)
+#install.packages('corrplot')
+library(corrplot)
+#intall.packages('VIM')
+library(VIM)
+
+# for imputing the data:
+# install.packages('mice')
+library(mice)
+
+# for computation:
+#install.packages('survival')
+library(survival)
+
+# for visualization and displaying statistics:
+#install.packages('broom')
+library(broom)
+#install.packages('survminer')
+library(survminer)
+#install.packages('ggplot2')
+library(ggplot2)
+
+
+# Functions for data cleaning 
+# for printing nice tables
+mykable <- function(x, ...) {
+  kable(x, ...) %>%
+    kable_styling(bootstrap_options = c("responsive", "consensed", "hover", "striped"))
+}
+
+# for printing cross tabulations
+tablist <- function(df, ...) {
+  
+  group_var <- quos(...)
+
+  if (nrow(df)==0) {
+    return("No observations")
+  }
+  
+  df$tot <- nrow(df)
+  
+  df %>% 
+    group_by(!!!group_var) %>%
+    summarise(
+      n   = n(),
+      pct = max(100 * (n / tot))
+    )
+
+}
+
+```
+
+
+
+
+### Step 1: Read in and visualize the data{.tabset}
+#### Summary statistics
+```{r readin, include=TRUE, results = 'asis', fig.width=4}
+
+# Load data into local environment
+lung <- lung
+# Describe data
+print(dfSummary(lung, 
+                plain.ascii  = FALSE, 
+                style        = "grid", 
+                graph.magnif = .75, 
+                valid.col    = FALSE,
+                varnumbers   = FALSE,
+                tmp.img.dir  = "/tmp"), method = 'render')
+
+
+# Data documentation: https://www.rdocumentation.org/packages/survival/versions/3.1-12/topics/lung
+```
+
+
+#### Data structure
+```{r readin2, include=TRUE, results = 'asis'}
+
+# Check first observations for structure
+mykable(head(lung[1:5,]))
+```
+
+
+
+
+### Step 2: Missing value imputation{.tabset}
+#### Overview
+* As shown in the summary above, there is relatively little missing information in our data, with the exception of meal calories and wt.loss. We explored these values and imputed them.
+
+#### Missing Data
+* Interpretation: For each column: 
+  + A $1$ indicates that the value is there for the column
+  + A $0$ shows that we are missing the value for that column.
+  + We have 167 rows were each column has a $1$, thus we have 167 rows of complete data.
+  + We have 42 rows where the value of meal.cal is missing, 10 rows where the value of wt.loss is missing, etc.
+  + In total, there are 67 rows that have a missing value - 47 of those 67 rows are missing meal.cal, 14 are missing wt.loss, etc. 
+
+```{r cleaning, include = TRUE}
+
+# Check missing data patterns
+mykable(md.pattern(lung, plot = FALSE))
+```
+
+
+#### Missing Data - Graphically
+* We can look at this graphically to see which variables have many missing values. 
+```{r cleaning1, include = TRUE}
+
+# Check missing data plots
+aggr_plot <- aggr(lung, col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, labels=names(data), cex.axis=.7, gap=3, ylab=c("Histogram of missing data","Pattern"))
+```
+
+
+#### Missing Data - Correction  
+* To correct these missing values, we will use the mice() function to perform Multivariate Imputation By Chained Equations. 
+* Methodological notes:  
+  + We will create 5 different numbers for each missing value, done in 50 different iterations.  
+  + Our method is predictive mean matching, the standard for the mice package, that will try and predict a number based on the information that is known.   
+  + Those 50 iterations will be averaged for one final number.  
+  + We will set a seed at 500 to keep our random results consistent.  
+
+```{r cleaning 2, include=TRUE}
+
+# call mice package
+tempData <- mice(lung, m = 5, method = "pmm", maxit = 50, seed = 500, printFlag = FALSE)
+
+# check the first predictive values for our missing meal.cal numbers look like:
+mykable(head(tempData$imp$meal.cal, 5))
+
+```
+* We use the complete() function to select one of the five predicted values as our missing value. 
+  + For example, the third row in our data, which has NA for meal.cal, has predicted values 1075 (1st iteration), 975 (2nd iteration), 1150, 1025, and 1225. We can pick one of these values to represent the missing value for meal.cal in our third row.
+  
+  
+```{r cleaning3, include=TRUE}
+
+# For this example, we pick the first value to use in out imputation.
+lung <- complete(tempData, 1)
+
+# check the imputed value
+mykable(head(lung))
+```
+
+
+
+
+### Step 3: Additional constructs{.tabset}
+#### Overview
+* In preparation for building our model, we created new constructs from the variables included in the data, namely:
+  + We explored age constructions, looking at both 1.) ages above and below the mean value 2.) ages broken into decades. Decade-based age seemed to better explain our outcome variable, so we will use that moving forward.
+  +  We recoded our censoring variable (Status) to be a 0/1 indicator where 1 represents deceased and 0 represents censored (alive at the end of the observation window as far as we know). 
+
+#### Age brackets
+```{r constructs, include=TRUE}
+
+# check initial distributions to see what might be good cutpoints
+histo <- function(xvar, labs){
+             # Histogram with density plot and mean line
+            ggplot(lung, aes(x=xvar)) + 
+                   geom_histogram(aes(y=..density..), colour="black", fill="white")+
+                   geom_density(alpha=.2, fill="#FF6666") + 
+                   geom_vline(aes(xintercept=mean(xvar)),
+                   color="blue", linetype="dashed", size=1)+ 
+                   theme(panel.grid.major.y = element_line(size = .1, color = "light grey"), 
+                         panel.background   = element_blank()) + 
+                   labs(x= labs) +
+                   ggtitle(paste("Distribution of ", labs))
+  }
+
+histo(lung$age, "Age - continuous")
+  
+lung <- lung %>%
+         # create an age bracket variable for the purposes of visualization. Older and younger than mean. Based on decades
+  mutate(age_brac_mean = case_when(age  <  mean(age, na.rm=TRUE)  ~ 0,
+                                   age  >= mean(age, na.rm=TRUE)  ~ 1,
+                                   TRUE                           ~ NA_real_),
+         age_brac_dec  = case_when(age  <=  50                    ~ 0,
+                                   age  <=  60                    ~ 1,
+                                   age  <=  70                    ~ 2,
+                                   age  >   70                    ~ 3,
+                                   TRUE                           ~ NA_real_),
+         # binary 0/1 indicators for censored (alive) vs. dead
+         deceased = case_when(status==2  ~ 1,
+                              status==1  ~ 0,
+                              TRUE       ~ NA_real_))
+
+print_cats <- function(cvar, labs, width){
+                    # bar graphs
+                    ggplot(lung, aes(x=cvar)) + 
+                           labs(x = labs) +
+                           geom_bar()+
+                           theme(panel.grid.major.y = element_line(size = .1, color = "light grey"), 
+                           panel.background   = element_blank()) + 
+                           ggtitle(paste("Distribution of categorical variable: ", labs))}
+    
+print_cats(lung$age_brac_mean, "Age Bracket - above or below mean", len(unique(lung$age_brac_mean)))
+print_cats(lung$age_brac_dec,  "Age Bracket - 10-year buckets",     len(unique(lung$age_brac_dec)))
+
+```
+
+
+#### Censoring variable
+```{r constructs1, results='asis'}
+
+# plot cross tabulation
+mykable(tablist(lung, deceased, status))
+
+# drop original versions of variables no longer needed
+lung <- lung %>%
+  dplyr::select(-c("age", "status"))
+```
+
+
+
+
+### Step 4: Exploratory Data Analysis{.tabset}
+#### Overview
+* Before building our model, we performed exploratory data analysis which included:
+  + Assessing correlation between explanatory variables
+  + Assessing variable distributions and outliers using box plots.
+  
+#### Correlations
+```{r eda, include=TRUE}
+
+# look at correlations between variables
+corrs <- cor(lung)
+corrplot(corrs, method="circle")
+```
+
+
+#### Box plots
+```{r eda1}
+
+# define theme for all plots
+theme <- theme(panel.grid.major.y = element_line(size = .1, color = "light grey"), 
+                         panel.background   = element_blank())
+# look at box plots
+g <- ggplot(lung, aes(as.factor(sex), time, fill = as.factor(sex))) + theme
+
+# by sex:
+g + geom_boxplot() +
+  labs(title="Survival Time versus Sex",x="Sex", y = "Survival Time",
+       fill = "Sex")
+
+# by age: 
+g <- ggplot(lung, aes(as.factor(age_brac_dec), time, fill = as.factor(age_brac_dec))) + theme
+
+g + geom_boxplot() +
+  labs(title="Survival Time versus Age Group",x="Age Group", y = "Survival Time") +
+  scale_fill_discrete(name = "Age Group", labels = c("<= 50", ">50 to <=60", ">60 to <=70", ">70"))
+
+# by ph.ecog:
+g <- ggplot(lung, aes(as.factor(ph.ecog), time, fill = as.factor(ph.ecog))) +theme
+
+g + geom_boxplot() +
+  labs(title="Survival Time versus ECOG Score",x="ECOG Score", y = "Survival Time") +
+  scale_fill_discrete(name = "ECOG Score")
+
+```
+
+
+
+
+### Step 5: Examine Kaplan Meier curves{.tabset}
+#### Overall
+```{r km, fig.width=4}
+
+# Fit the models
+surv <- Surv(lung$time, lung$deceased)
+
+fit <- survfit(surv~1, data = lung)
+
+med <- median(fit$surv)
+
+# Visualize with survminer.
+ggsurvplot(fit, 
+           data = lung, 
+           risk.table = TRUE, 
+           tables.height = 0.2, 
+           tables.theme = theme_cleantable(),
+           title = "Survivor Function",
+            xlab = "Time (in days)",
+           surv.median.line = "hv")
+
+ggsurvplot(fit, 
+           data = lung, 
+           risk.table = TRUE, 
+           tables.height = 0.2, 
+           tables.theme = theme_cleantable(),
+           xlab = "Time (in days)",
+           title = "Cumulative Hazard", fun = 'cumhaz')
+
+
+```
+
+
+#### By Sex
+```{r km1, include=TRUE, fig.width=4}
+# Including sex in the model
+fit_sex <- survfit(surv~sex, data = lung)
+
+# plot the models
+ggsurvplot(fit_sex, 
+           data = lung, 
+           risk.table = FALSE, 
+           tables.height = 0.2, 
+           tables.theme = theme_cleantable(),
+           xlab = "Time (in days)",
+           title = "Survivor Function",
+           surv.median.line = "hv")
+
+ggsurvplot(fit_sex, 
+           data = lung, 
+           risk.table = FALSE, 
+           tables.height = 0.2, 
+           tables.theme = theme_cleantable(),
+           xlab = "Time (in days)",
+           title = "Cumulative Hazard", 
+           fun = 'cumhaz')
+```
+
+
+
+
+
+#### By Age
+```{r km2, include=TRUE, fig.width=4}
+
+# Including age in the model
+
+fit_age <- survfit(surv~age_brac_mean, data = lung)
+
+# plot the models
+ggsurvplot(fit_age, 
+           data = lung, 
+           risk.table = FALSE, 
+           tables.height = 0.2, 
+           tables.theme = theme_cleantable(),
+           title = "Survivor Function",
+           xlab = "Time (in days)",
+           surv.median.line = "hv")
+
+ggsurvplot(fit_age, 
+           data = lung, 
+           risk.table = FALSE, 
+           tables.height = 0.2, 
+           tables.theme = theme_cleantable(),
+           xlab  = "Time (in days)",
+           title = "Cumulative Hazard", 
+           fun = 'cumhaz')
+```
+
+
+### Step 6: Estimate models{.tabset}
+#### Sex only
+```{r modeling1, echo=TRUE}
+
+# Build model with one explanatory variable
+cox_model1 <- coxph(formula = Surv(time, deceased) ~ sex, data = lung) 
+
+# check summary
+summary(cox_model1)
+
+# visualize significant variables
+# Not incredibly helpful with one explanatory var. Commented out: ggforest(cox_model1, data = lung)
+```
+
+* Interpretation:
+  + Coefficients:
+    * Reminder: $\lambda(t\;|\;x) = \lambda_0(t)exp(X^{T}\beta)$
+    * Our coefficients represent the difference in the log hazard between males and females. For continuous variables, this represents the change in the log hazard function for a one unit change in x. 
+      * Example: The coefficient on sex is -0.5310. The log hazard (log instantaneous rate of death) is -0.5310 lower for females, compare to males (going from sex=1 to sex=2)
+    * Exp(coef) is the hazard ratio. Exp(-coef) is therefore the (inverse) hazard ratio.
+      * Example: The exp(coef) on sex is $exp(-0.5310) = 0.5880$. At a given point in time, females will have an instantaneous rate of death that is .588 times that of males.
+      
+  + Tests:
+    * We have three different tests to explain the model as a whole. The first is a likelihood ratio test, which compares this model to the model with just the intercept term, based on their likelihoods. 
+    * Another classical approach to hypothesis testing is the Wald Test, which assesses constraints on our parameters based on the predicted estimate and its hypothesized value under the null hypothesis. 
+    * The log rank test compares the survival distributions for our two samples - time and status. This is used to test for our censored data. 
+
+* We can also calculate the likelihood function "by hand."  
+  + A partial likelihood is the conditional probabilities of the observed individual, being chosen from the risk set to fail.
+  + It can be modeled as: $\frac{\lambda(X_j|Z_j)}{\sum_{l\in R(X_j)}\lambda(X_j|Z_l)}$
+```{r byhand, echo=TRUE}
+
+##################################################################
+# Log partial likelihood for the Cox proportional hazards model
+###################################################################
+# X      : design matrix
+# status : vital status (1 - dead, 0 - alive)
+# times  : survival times
+# n.obs  : number of observed events
+
+# Risk set function - identify the individuals at risk at time t
+risk.set <- function(t) which(times >= t)
+
+# log partial likelihood function
+log.parlik <- function(beta){
+  # create a vector of T/Fs for dead or alive
+  status <- as.vector(as.logical(status))
+  # multiply x values by coefficients
+  Xbeta  <- as.vector(X%*%beta)
+  # sum the linear predictors for all individuals who have died
+  lpl1   <- sum(Xbeta[status])
+  temp   <- vector(   )
+  for(i in 1:n.obs) temp[i] <- log(sum(exp(Xbeta[rs[[i]]])))
+     lpl2 <- sum(temp)
+  return(-lpl1 + lpl2)
+}
+
+# Required variables
+X      <- as.matrix(cbind(lung$sex))
+status <- as.vector(lung$deceased)
+times  <- as.vector(lung$time)
+n.obs  <- sum(lung$deceased)
+
+# Risk set
+rs <- apply(as.matrix(times[as.logical(status)]), 1, risk.set)
+
+# Optimization step
+OPT <- optim(c(5),log.parlik, control = list(maxit = 1000))
+
+# Comparison
+MAT <- cbind( cox_model1$coefficients, OPT$par)
+colnames(MAT) <- c("survival package", "MPLE")
+mykable(MAT, digits = 4)
+
+```
+
+#### All covariates
+```{r modeling2, echo=TRUE}
+
+# Build model with one explanatory variable
+cox_model2 <- coxph(formula = Surv(time, deceased) ~ sex + age_brac_dec + ph.ecog +ph.karno + pat.karno + meal.cal + wt.loss, data = lung)
+
+# check summary
+summary(cox_model2)
+
+# visualize significant variables
+ggforest(cox_model2, data = lung)
+```
+
+* Interpretation:
+  + Only two of our variables are significant - sex and ph.ecog. we can see their significance in two different ways in the summary table: the p-values (both are significant at the .01 level) and their confidence intervals on their predicted hazard ratio does not include 1.
+
+
+```{r modeling3, eval=FALSE}
+#### Just significant vars - not shown during presentation 
+cox_model3  <- coxph(formula = Surv(time, deceased) ~ sex + ph.ecog, data = lung)
+
+# check summary
+summary(cox_model3)
+
+# visualize significant variables
+ggforest(cox_model3, data = lung)
+```
+
+
+
+
+### Step 7: Check CoxPH modeling assumptions  
+* After fitting out model, we check to make sure that model assumptions hold. As a reminder, some assumptions include:   
+  + Assumption 1: Censoring is non-informatvie.  
+  + Assumption 2: Survival times are independent.  
+  + Assumption 3: The CoxPH model assumes that the covariates do not vary with time.  
+  + **Assumption 4: Hazards are proportional over time. Hazard ratio is constant over time. Coefficients do not change over time.**
+
+
+#### Testing the proportional hazard assumption:{.tabset}
+##### Overall
+```{r assumptions, include=TRUE}
+
+# use the coxzph function to test the proportional hazard assumption
+
+cph <- cox.zph(cox_model2, transform="km", global=TRUE)
+print(cph)  # display the results 
+
+```
+
+##### Sex
+```{r assumptions1, include=TRUE}
+zp <- cox.zph(cox_model2, transform= function(time) log(time +20))
+plot(zp[1])
+
+```
+
+
+##### Age
+```{r assumptions2}
+plot(zp[2])
+```
+
+
+##### Ph.ecog
+```{r assumptions3}
+plot(zp[3])
+```
+
+
+##### Ph.karno
+```{r assumptions4}
+plot(zp[4])
+```
+
+
+##### Pat.Karno
+```{r assumptions5}
+plot(zp[5])
+```
+
+
+##### meal.cal
+```{r assumptions6}
+plot(zp[6])
+```
+##### Wt.loss
+```{r assumptions7}
+plot(zp[7])
+```
+
+#### Corrections
+
+* Create interaction term between time and problematic variable.
+* Use the time-transform functionality in coxph() to allow for a time-dependent coefficients.  
+* **One of the simplest extensions is a step function for $\beta(t)$, i.e., allow for different coefficients over different
+time intervals.**
+
+```{r assumptions8, results='asis'}
+
+lung_new <- survSplit(Surv(time, deceased) ~ ., data= lung, cut=c(50, 250), episode= "tgroup", id="id")
+mykable(head(lung_new))
+
+cox_model4 <- coxph(formula = Surv(tstart, time, deceased) ~ sex:strata(tgroup) + age_brac_dec + ph.ecog +ph.karno:strata(tgroup) + pat.karno + meal.cal + wt.loss, data = lung_new)
+
+cph2 <- cox.zph(cox_model4, transform="km", global=TRUE)
+```
+
+```{r assumptions9}
+print(cox_model4)
+print(cph2) 
+```
+
+### Step 8: Evaluate Goodness of fit{.tabset}
+#### Analysis of Deviance
+
+The Cox Diagnostic tests make it easy to analyze model deviance to see if the model explains more or less of the deviance than the saturated model at any points in the dataset. To interpret this chart, we can think of it this way:
+
+ - Positive values correspond to individuals that “failed too soon” compared to expected survival times
+ - Negative values correspond to individual that “took too long to fail” according to the model
+ - A high number of outliers indicate a poorly predicted by the model  
+ 
+1) Testing proportional Hazards assumption
+  - Validated when we see non-significant relationship between residuals and time
+  - Look for random pattern in residual plot against time
+
+2) Testing effect of influential observations 
+  - We can visualize either the deviance residuals or the dfbeta values
+  - Residuals should be evenly distributed about 0 with SD of 1
+  - dfbeta values show changes in coefficients divided by S.E.
+    - Plotting these values against beta coefficients should show random pattern with minimal outliers (influential observations)
+
+3) Testing non-linearity
+  - Confirm that our continuous variables have a linear form
+  - Displays graphs of continous covariates against Martingale residuals of null Cox PH models
+  - Martingale Residuals (-infinity, +1)
+    - Value of martingale near 1 represents individuals that “died too soon”
+    - Large negative values mean individuals lived too long
+
+```{r Analysis of Deviance, include=TRUE}
+# SOURCE: http://www.sthda.com/english/wiki/cox-model-assumptions
+
+ggcoxdiagnostics(cox_model4, type = "deviance",
+                 linear.predictions = FALSE, ggtheme = theme_bw())
+
+```
+
+#### Analysis of regression coefficients
+
+To perform one more test (yes, there are still others!), we'll ask: If you exclude an observation from the data and refit the model, you will get new parameter estimates. How much do the estimates change?
+
+These residuals represent the estimated changes in the regression coefficients upon deleting each observation in turn and then dividing them by their standard errors.
+
+In the cases below, most observations are relatively consistent and don't appear to skew the model disproportionately, though you'll notice (even accounting for difference in axis), that age bracket varies much less than other factors, such as sex and weight loss.
+
+```{r Analysis of Residuals, include=TRUE}
+ggcoxdiagnostics(cox_model4, type = "dfbetas",
+                 linear.predictions = FALSE, ggtheme = theme_bw())
+
+```
+
+
+```{r, eval=FALSE}
+### Interactive
+
+#interactive viz: https://github.com/hinkelman/shiny-survival-covariate
+#https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5580407/
+#https://www.emilyzabor.com/tutorials/survival_analysis_in_r_tutorial.html#event_indicator
+#http://www.sthda.com/english/wiki/cox-proportional-hazards-model
+
+#http://people.math.aau.dk/~rw/Undervisning/DurationAnalysis/Slides/lektion3.pdf
+#https://kkoehler.public.iastate.edu/stat565/coxph.4page.pdf
+
+
+library(shiny) 
+lung_10 <- lung %>%
+  slice(1:10)
+
+model = coxph(formula = Surv(time, status) ~ sex + ph.ecog, data = lung)  
+
+server(function(input, output){ 
+  output$plot_predicted <- renderPlot({
+    nd = data.frame(sex=c("1","2"), Ecog=input$ph.ecog)
+    # Plot mean survival curves
+    plot(survfit(model,newdata=nd),col=c(2,1),lwd=2,conf.int=F,xlim=c(0,720), xlab="Time (min)",ylab="Proportion Remaining in Sample")
+    # Plot 95% confidence intervals
+    lines(survfit(model,newdata=nd),conf.int=T,col=c(2,1),lty=2,lwd=1.5)
+    legend(500,1,legend = c("1","2"),lwd=2,col=c(1,2),bty="n")   
+   }) 
+   output$summary <- renderPrint({ 
+     summary(model) 
+   }) 
+})
+
+# Define UI for dataset viewer application 
+ui <- pageWithSidebar(
+  headerPanel(""),
+  sidebarPanel(sliderInput(inputId = "ph.ecog",
+               label = "ECOG performance score",
+               min = 0,
+               max = 100,
+               value = 2,
+               animate = animationOptions(interval=2000, loop=TRUE))),
+  mainPanel(
+    tabsetPanel(
+      tabPanel("Plot", plotOutput("plot_predicted")),
+      tabPanel("Model Summary", verbatimTextOutput("summary")),
+      id = "tabs"))
+)
+
+shinyApp(ui = ui, server = server)
+```
